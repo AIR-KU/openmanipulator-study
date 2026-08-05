@@ -11,6 +11,7 @@ ADDR_TORQUE_ENABLE          = 64
 ADDR_GOAL_POSITION          = 116
 LEN_GOAL_POSITION           = 4
 ADDR_PROFILE_VELOCITY       = 112
+ADDR_PRESENT_POSITION       = 132       # [추가] 현재 위치를 읽어오기 위한 주소
 
 PROFILE_VELOCITY_VALUE      = 80        # 실시간 연속 제어에 알맞은 속도 값 (조절 가능)
 BAUDRATE                    = 1000000   
@@ -22,14 +23,17 @@ DXL_ID_LIST                 = [11, 12, 13, 14, 15]
 TORQUE_ENABLE               = 1
 TORQUE_DISABLE              = 0
 
-# 모터별 '현재 목표 위치' 초기값 (중간 위치 2048)
-current_goals = {
+# [중요] 프로그램 시작 및 종료 시 안전하게 위치할 '초기 자세' 저장
+INITIAL_POSITIONS = {
     11: 0,
-    12: 1024,
-    13: 2800,
+    12: 710,
+    13: 3000,
     14: 1024,
     15: 512
 }
+
+# 모터별 '현재 목표 위치' (처음엔 초기 자세로 시작)
+current_goals = INITIAL_POSITIONS.copy()
 
 STEP_SIZE = 35  # 키를 누르고 있을 때 1회 반복당 움직일 위치 변화량
 MIN_POS = 0
@@ -72,14 +76,55 @@ print("========================================================\n")
 
 # --- 메인 실시간 홀드 루프 ---
 while True:
-    # ESC 키를 누르면 즉시 탈출
+    # --- [업그레이드] 순차적 안전 복귀 + 11번 장애물 감지 ---
     if keyboard.is_pressed('esc'):
-        print("프로그램을 종료합니다.")
-        break
+        print("\n[시스템] ESC 종료 명령이 입력되었습니다.")
+        print("[시스템] 충돌 방지를 위해 관절을 끝단부터 순서대로 접어 복귀합니다...")
+        
+        SAFE_RETURN_ORDER = [15, 14, 13, 12, 11]
+        
+        for dxl_id in SAFE_RETURN_ORDER:
+            print(f"[시스템] 모터 ID {dxl_id} 초기 자세로 복귀 중...")
+            add_sync_write_param(dxl_id, INITIAL_POSITIONS[dxl_id])
+            groupSyncWrite.txPacket()
+            groupSyncWrite.clearParam()
+            
+            # --- 11번 베이스 모터 전용 장애물 감지 로직 ---
+            if dxl_id == 11:
+                stuck_count = 0
+                last_position = -1
+                
+                # 0.5초 간격으로 최대 8번(총 4초) 현재 위치를 검사합니다.
+                for _ in range(4):
+                    time.sleep(0.5)
+                    # 현재 모터의 실제 위치를 읽어옵니다.
+                    dxl_present_pos, comm_res, error = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRESENT_POSITION)
+                    
+                    # 목표 지점에 무사히 도착했다면 (오차 20 이내) 검사 종료
+                    if abs(dxl_present_pos - INITIAL_POSITIONS[dxl_id]) < 20:
+                        break
+                        
+                    # 이전 위치와 비교하여 5 이하로만 움직였다면 (어딘가에 막혀서 못 가는 상태)
+                    if last_position != -1 and abs(dxl_present_pos - last_position) <= 5:
+                        stuck_count += 1
+                        if stuck_count >= 2: # 2번 연속 제자리걸음이면 장애물로 확정
+                            print("\n🚨 [경고] 11번 모터 이동 중 장애물(막힘)이 감지되었습니다!")
+                            print("🚨 모터 보호를 위해 복귀를 즉시 중단하고 현재 위치에서 종료합니다.")
+                            break # 감지 루프 탈출, 그 상태로 종료 진행
+                    else:
+                        stuck_count = 0 # 위치가 잘 변하고 있다면 카운트 초기화
+                        
+                    last_position = dxl_present_pos
+            
+            # --- 12~15번 모터는 기존처럼 1초 대기 ---
+            else:
+                time.sleep(1.0) 
+                
+        print("\n[시스템] 안전 복귀 시퀀스 종료! 토크를 해제합니다.")
+        break  # 루프 탈출 후 토크 끄는 코드로 이동
 
     updated = False
 
-    # 각 키가 '눌려 있는 상태(is_pressed)'인지 실시간으로 검사합니다.
     # 11번 모터
     if keyboard.is_pressed('q'):
         current_goals[11] += STEP_SIZE
@@ -120,10 +165,8 @@ while True:
         current_goals[15] -= STEP_SIZE
         updated = True
 
-    # 키가 하나라도 눌려있다면 한 번에 패킷을 묶어서 전송합니다.
     if updated:
         for dxl_id in DXL_ID_LIST:
-            # 범위를 벗어나지 않도록 제한
             if current_goals[dxl_id] > MAX_POS: current_goals[dxl_id] = MAX_POS
             if current_goals[dxl_id] < MIN_POS: current_goals[dxl_id] = MIN_POS
             
@@ -132,7 +175,6 @@ while True:
         groupSyncWrite.txPacket()
         groupSyncWrite.clearParam()
 
-    # 너무 빠르게 패킷이 몰려 통신 부하가 걸리는 것을 방지하기 위한 미세 딜레이
     time.sleep(0.03)
 
 # 종료 시 토크 해제
