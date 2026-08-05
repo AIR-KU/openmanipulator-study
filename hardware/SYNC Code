@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import time
+import keyboard  # 키를 꾹 누르는 상태를 감지하기 위한 라이브러리
+
+from dynamixel_sdk import *
+
+# --- 기본 설정 ---
+ADDR_TORQUE_ENABLE          = 64
+ADDR_GOAL_POSITION          = 116
+LEN_GOAL_POSITION           = 4
+ADDR_PROFILE_VELOCITY       = 112
+
+PROFILE_VELOCITY_VALUE      = 80        # 실시간 연속 제어에 알맞은 속도 값 (조절 가능)
+BAUDRATE                    = 1000000   
+PROTOCOL_VERSION            = 2.0
+DEVICENAME                  = 'COM5'    
+
+DXL_ID_LIST                 = [11, 12, 13, 14, 15]
+
+TORQUE_ENABLE               = 1
+TORQUE_DISABLE              = 0
+
+# 모터별 '현재 목표 위치' 초기값 (중간 위치 2048)
+current_goals = {
+    11: 0,
+    12: 1024,
+    13: 2800,
+    14: 1024,
+    15: 512
+}
+
+STEP_SIZE = 35  # 키를 누르고 있을 때 1회 반복당 움직일 위치 변화량
+MIN_POS = 0
+MAX_POS = 4095
+
+# 통신 및 패킷 핸들러 초기화
+portHandler = PortHandler(DEVICENAME)
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_GOAL_POSITION, LEN_GOAL_POSITION)
+
+if portHandler.openPort(): print("Succeeded to open the port")
+else: quit()
+if portHandler.setBaudRate(BAUDRATE): print("Succeeded to change the baudrate")
+else: quit()
+
+# 속도 설정 및 토크 온 (스냅 방지)
+for dxl_id in DXL_ID_LIST:
+    packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY_VALUE)
+    packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+print("5 Dynamixels connected & Ready for Hold-Control!")
+
+# 4바이트 패킷 변환 도우미 함수
+def add_sync_write_param(motor_id, target_pos):
+    param_goal_position = [
+        DXL_LOBYTE(DXL_LOWORD(target_pos)),
+        DXL_HIBYTE(DXL_LOWORD(target_pos)),
+        DXL_LOBYTE(DXL_HIWORD(target_pos)),
+        DXL_HIBYTE(DXL_HIWORD(target_pos))
+    ]
+    groupSyncWrite.addParam(motor_id, param_goal_position)
+
+print("\n================== 실시간 홀드 조종기 ==================")
+print("[11번 모터] Q (증가) / A (감소)")
+print("[12번 모터] W (증가) / S (감소)")
+print("[13번 모터] E (증가) / D (감소)")
+print("[14번 모터] R (증가) / F (감소)")
+print("[15번 모터] T (증가) / G (감소)")
+print("종료하려면 ESC 키를 누르세요.")
+print("========================================================\n")
+
+# --- 메인 실시간 홀드 루프 ---
+while True:
+    # ESC 키를 누르면 즉시 탈출
+    if keyboard.is_pressed('esc'):
+        print("프로그램을 종료합니다.")
+        break
+
+    updated = False
+
+    # 각 키가 '눌려 있는 상태(is_pressed)'인지 실시간으로 검사합니다.
+    # 11번 모터
+    if keyboard.is_pressed('q'):
+        current_goals[11] += STEP_SIZE
+        updated = True
+    elif keyboard.is_pressed('a'):
+        current_goals[11] -= STEP_SIZE
+        updated = True
+
+    # 12번 모터
+    if keyboard.is_pressed('w'):
+        current_goals[12] += STEP_SIZE
+        updated = True
+    elif keyboard.is_pressed('s'):
+        current_goals[12] -= STEP_SIZE
+        updated = True
+
+    # 13번 모터
+    if keyboard.is_pressed('e'):
+        current_goals[13] += STEP_SIZE
+        updated = True
+    elif keyboard.is_pressed('d'):
+        current_goals[13] -= STEP_SIZE
+        updated = True
+
+    # 14번 모터
+    if keyboard.is_pressed('r'):
+        current_goals[14] += STEP_SIZE
+        updated = True
+    elif keyboard.is_pressed('f'):
+        current_goals[14] -= STEP_SIZE
+        updated = True
+
+    # 15번 모터
+    if keyboard.is_pressed('t'):
+        current_goals[15] += STEP_SIZE
+        updated = True
+    elif keyboard.is_pressed('g'):
+        current_goals[15] -= STEP_SIZE
+        updated = True
+
+    # 키가 하나라도 눌려있다면 한 번에 패킷을 묶어서 전송합니다.
+    if updated:
+        for dxl_id in DXL_ID_LIST:
+            # 범위를 벗어나지 않도록 제한
+            if current_goals[dxl_id] > MAX_POS: current_goals[dxl_id] = MAX_POS
+            if current_goals[dxl_id] < MIN_POS: current_goals[dxl_id] = MIN_POS
+            
+            add_sync_write_param(dxl_id, current_goals[dxl_id])
+
+        groupSyncWrite.txPacket()
+        groupSyncWrite.clearParam()
+
+    # 너무 빠르게 패킷이 몰려 통신 부하가 걸리는 것을 방지하기 위한 미세 딜레이
+    time.sleep(0.03)
+
+# 종료 시 토크 해제
+for dxl_id in DXL_ID_LIST:
+    packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+portHandler.closePort()
