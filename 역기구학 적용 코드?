@@ -1,0 +1,242 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import time
+import math
+import keyboard
+from dynamixel_sdk import *
+
+# ==========================================
+# 1. 하드웨어 및 기본 설정
+# ==========================================
+ADDR_TORQUE_ENABLE          = 64
+ADDR_GOAL_POSITION          = 116
+LEN_GOAL_POSITION           = 4
+ADDR_PROFILE_VELOCITY       = 112
+ADDR_PRESENT_POSITION       = 132
+
+PROFILE_VELOCITY_VALUE      = 80
+BAUDRATE                    = 1000000   
+PROTOCOL_VERSION            = 2.0
+DEVICENAME                  = 'COM5'    
+
+DXL_ID_LIST                 = [11, 12, 13, 14, 15]
+TORQUE_ENABLE               = 1
+TORQUE_DISABLE              = 0
+
+# 로봇 물리 링크 길이 (단위: mm)
+L1 = 130.0  
+L2 = 124.0  
+L3 = 126.0  
+
+INITIAL_POSITIONS = {11: 2048, 12: 720, 13: 3030, 14: 2390, 15: 1024}
+FINAL_POSITIONS = {11: 0, 12: 720, 13: 3030, 14: 840, 15: 512}
+
+current_goals = INITIAL_POSITIONS.copy()
+MIN_POS, MAX_POS = 0, 4095
+# 제어 스텝 사이즈
+JOINT_STEP = 20      # 관절 모드: 펄스 변화량
+XYZ_STEP = 3.0       # XYZ 모드: 이동 거리(mm)
+
+# ==========================================
+# 2. 기구학 (Kinematics) 엔진
+# ==========================================
+def forward_kinematics(p11, p12, p13, p14):
+    """현재 모터 펄스를 바탕으로 끝단의 X, Y, Z 위치와 자세(Pitch)를 계산"""
+    t1 = (p11 - 2048) / 4096.0 * 2 * math.pi
+    t2 = -(p12 - 2048) / 4096.0 * 2 * math.pi
+    t3 = -(p13 - 2048) / 4096.0 * 2 * math.pi
+    t4 = -(p14 - 2048) / 4096.0 * 2 * math.pi
+
+    rw = L1 * math.cos(t2) + L2 * math.cos(t2 + t3)
+    zw = L1 * math.sin(t2) + L2 * math.sin(t2 + t3)
+
+    pitch = t2 + t3 + t4
+    r = rw + L3 * math.cos(pitch)
+    z = zw + L3 * math.sin(pitch)
+
+    x = r * math.cos(t1)
+    y = r * math.sin(t1)
+    
+    return x, y, z, pitch
+
+def inverse_kinematics(x, y, z, pitch):
+    """목표 X, Y, Z와 자세(Pitch)를 모터 펄스로 역산"""
+    t1 = math.atan2(y, x)
+    r = math.sqrt(x**2 + y**2)
+
+    rw = r - L3 * math.cos(pitch)
+    zw = z - L3 * math.sin(pitch)
+
+    D2 = rw**2 + zw**2
+    if D2 > (L1 + L2)**2: return None # 도달 불가능 영역 차단
+
+    cos_t3 = (D2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_t3 = max(-1.0, min(1.0, cos_t3))
+    t3 = -math.acos(cos_t3)
+
+    alpha = math.atan2(zw, rw)
+    beta = math.atan2(L2 * math.sin(abs(t3)), L1 + L2 * math.cos(t3))
+    t2 = alpha + beta
+
+    t4 = pitch - t2 - t3
+
+    return {
+        11: int(t1 * 4096 / (2*math.pi)) + 2048,
+        12: int(-t2 * 4096 / (2*math.pi)) + 2048,
+        13: int(-t3 * 4096 / (2*math.pi)) + 2048,
+        14: int(-t4 * 4096 / (2*math.pi)) + 2048
+    }
+
+# ==========================================
+# 3. 통신 및 초기화 설정
+# ==========================================
+portHandler = PortHandler(DEVICENAME)
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_GOAL_POSITION, LEN_GOAL_POSITION)
+
+if portHandler.openPort() and portHandler.setBaudRate(BAUDRATE):
+    print("포트 및 통신 속도 설정 완료")
+else: quit()
+
+for dxl_id in DXL_ID_LIST:
+    packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY_VALUE)
+    packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+
+def add_sync_write_param(motor_id, target_pos):
+    target_pos = max(MIN_POS, min(MAX_POS, target_pos))
+    param_goal_position = [
+        DXL_LOBYTE(DXL_LOWORD(target_pos)), DXL_HIBYTE(DXL_LOWORD(target_pos)),
+        DXL_LOBYTE(DXL_HIWORD(target_pos)), DXL_HIBYTE(DXL_HIWORD(target_pos))
+    ]
+    groupSyncWrite.addParam(motor_id, param_goal_position)
+
+print("\n[시스템] 초기 자세로 순차 이동합니다...")
+for dxl_id in [11, 12, 13, 14, 15]:
+    add_sync_write_param(dxl_id, INITIAL_POSITIONS[dxl_id])
+    groupSyncWrite.txPacket()
+    groupSyncWrite.clearParam()
+    time.sleep(1.0)
+
+# ==========================================
+# 4. 메인 제어 루프
+# ==========================================
+control_mode = "JOINT" # "JOINT" 또는 "XYZ"
+space_pressed_last = False
+
+# XYZ 모드용 변수
+target_x, target_y, target_z, target_pitch = 0, 0, 0, 0
+
+print("\n================== 모드 전환형 조종기 ==================")
+print(" [Spacebar] 모드 전환 (관절 제어 <-> XYZ 공간 제어)")
+print("\n [관절 제어 모드]")
+print(" 11~14번: Q/A, W/S, E/D, R/F")
+print("\n [XYZ 공간 제어 모드]")
+print(" X축(앞/뒤): W / S")
+print(" Y축(좌/우): A / D")
+print(" Z축(상/하): Q / E")
+print("\n [공통 제어]")
+print(" 집게(15번): T / G")
+print(" 종료: ESC")
+print("========================================================\n")
+
+try:
+    while True:
+        # --- 종료 시퀀스 ---
+        if keyboard.is_pressed('esc'):
+            print("\n[시스템] 마지막 자세로 복귀합니다...")
+            for dxl_id in [15, 14, 13, 12, 11]:
+                add_sync_write_param(dxl_id, FINAL_POSITIONS[dxl_id])
+                groupSyncWrite.txPacket()
+                groupSyncWrite.clearParam()
+                
+                if dxl_id == 11:
+                    stuck_count, last_position = 0, -1
+                    for _ in range(4):
+                        time.sleep(0.5)
+                        pos, _, _ = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRESENT_POSITION)
+                        if abs(pos - FINAL_POSITIONS[dxl_id]) < 20: break
+                        if last_position != -1 and abs(pos - last_position) <= 5:
+                            stuck_count += 1
+                            if stuck_count >= 2: break
+                        else: stuck_count = 0 
+                        last_position = pos
+                else:
+                    time.sleep(1.0) 
+            break  
+            
+        # --- 모드 전환 토글 (Spacebar) ---
+        is_space_pressed = keyboard.is_pressed('space')
+        if is_space_pressed and not space_pressed_last:
+            if control_mode == "JOINT":
+                control_mode = "XYZ"
+                # 전환 순간의 관절 각도를 읽어 현재 3D 좌표(x,y,z)와 자세(pitch)를 고정시킴
+                target_x, target_y, target_z, target_pitch = forward_kinematics(
+                    current_goals[11], current_goals[12], current_goals[13], current_goals[14]
+                )
+                print(f"\n🔄 [XYZ 모드 ON] 현재 위치: X={target_x:.1f}, Y={target_y:.1f}, Z={target_z:.1f}")
+            else:
+                control_mode = "JOINT"
+                print("\n🔄 [관절 모드 ON] 개별 모터 제어 활성화")
+        space_pressed_last = is_space_pressed
+
+        updated_motors = []
+        
+        # --- 1. XYZ 공간 제어 모드 ---
+        if control_mode == "XYZ":
+            xyz_updated = False
+            prev_x, prev_y, prev_z = target_x, target_y, target_z
+            
+            if keyboard.is_pressed('w'): target_x += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('s'): target_x -= XYZ_STEP; xyz_updated = True
+            
+            if keyboard.is_pressed('a'): target_y += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('d'): target_y -= XYZ_STEP; xyz_updated = True
+            
+            if keyboard.is_pressed('q'): target_z += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('e'): target_z -= XYZ_STEP; xyz_updated = True
+            
+            if xyz_updated:
+                # 역기구학 연산으로 이동할 좌표가 닿는 곳인지 확인
+                ik_result = inverse_kinematics(target_x, target_y, target_z, target_pitch)
+                if ik_result:
+                    for dxl_id in [11, 12, 13, 14]:
+                        current_goals[dxl_id] = ik_result[dxl_id]
+                        updated_motors.append(dxl_id)
+                else:
+                    # 도달 불가 영역이면 이전 좌표로 원복
+                    target_x, target_y, target_z = prev_x, prev_y, prev_z
+        
+        # --- 2. 관절 제어 모드 ---
+        elif control_mode == "JOINT":
+            if keyboard.is_pressed('q'): current_goals[11] += JOINT_STEP; updated_motors.append(11)
+            elif keyboard.is_pressed('a'): current_goals[11] -= JOINT_STEP; updated_motors.append(11)
+            
+            if keyboard.is_pressed('w'): current_goals[12] += JOINT_STEP; updated_motors.append(12)
+            elif keyboard.is_pressed('s'): current_goals[12] -= JOINT_STEP; updated_motors.append(12)
+            
+            if keyboard.is_pressed('e'): current_goals[13] += JOINT_STEP; updated_motors.append(13)
+            elif keyboard.is_pressed('d'): current_goals[13] -= JOINT_STEP; updated_motors.append(13)
+            
+            if keyboard.is_pressed('r'): current_goals[14] += JOINT_STEP; updated_motors.append(14)
+            elif keyboard.is_pressed('f'): current_goals[14] -= JOINT_STEP; updated_motors.append(14)
+
+        # --- 3. 공통 집게 제어 (모드 무관하게 상시 작동) ---
+        if keyboard.is_pressed('t'): current_goals[15] += JOINT_STEP; updated_motors.append(15)
+        elif keyboard.is_pressed('g'): current_goals[15] -= JOINT_STEP; updated_motors.append(15)
+
+        # --- 데이터 전송 ---
+        if updated_motors:
+            updated_motors = list(set(updated_motors))
+            for dxl_id in updated_motors:
+                add_sync_write_param(dxl_id, current_goals[dxl_id])
+            groupSyncWrite.txPacket()
+            groupSyncWrite.clearParam()
+
+        time.sleep(0.03)
+
+finally:
+    for dxl_id in DXL_ID_LIST:
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+    portHandler.closePort()
+    print("\n시스템이 안전하게 종료되었습니다.")
