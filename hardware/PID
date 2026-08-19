@@ -1,0 +1,288 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import time
+import math
+import keyboard
+from dynamixel_sdk import *
+
+# ==========================================
+# 1. 하드웨어 및 기본 설정
+# ==========================================
+# --- 다이나믹셀 컨트롤 테이블 주소 ---
+ADDR_OPERATING_MODE         = 11    
+ADDR_TORQUE_ENABLE          = 64    
+ADDR_POSITION_D_GAIN        = 80    # (NEW) 포지션 D 게인 (2 Byte)
+ADDR_POSITION_I_GAIN        = 82    # (NEW) 포지션 I 게인 (2 Byte)
+ADDR_POSITION_P_GAIN        = 84    # (NEW) 포지션 P 게인 (2 Byte)
+ADDR_GOAL_CURRENT           = 102   
+ADDR_PROFILE_ACCELERATION   = 108   
+ADDR_PROFILE_VELOCITY       = 112   
+ADDR_GOAL_POSITION          = 116   
+LEN_GOAL_POSITION           = 4     
+ADDR_PRESENT_POSITION       = 132   
+
+# --- PID 및 제어 튜닝 파라미터 ---
+POSITION_P_GAIN             = 800   # 당기는 힘 (탄성)
+POSITION_I_GAIN             = 0     # 누적 오차 제거
+POSITION_D_GAIN             = 2000  # 브레이크 (흔들림 방지, Damping)
+
+PROFILE_VELOCITY_VALUE      = 150   
+PROFILE_ACCELERATION_VALUE  = 0     
+
+GRIPPER_VELOCITY_VALUE      = 30    
+GRIPPER_ACCELERATION_VALUE  = 10    
+GRAB_FORCE                  = 100   
+
+XYZ_STEP   = 4.0     # 1회 누름당 이동 거리 (mm)
+JOINT_STEP = 35      
+
+# --- 통신 설정 ---
+BAUDRATE            = 1000000   
+PROTOCOL_VERSION    = 2.0
+DEVICENAME          = 'COM5'    
+
+DXL_ID_LIST         = [11, 12, 13, 14, 15]
+TORQUE_ENABLE       = 1
+TORQUE_DISABLE      = 0
+
+# --- 로봇 기구학 링크 길이 (단위: mm) ---
+L1 = 130.23  
+L2 = 124.0  
+L3 = 126.0  
+
+INITIAL_POSITIONS = {11: 2048, 12: 720, 13: 3030, 14: 2390, 15: 1024}
+FINAL_POSITIONS   = {11: 0, 12: 720, 13: 3030, 14: 840, 15: 512}
+
+current_goals = INITIAL_POSITIONS.copy()
+MIN_POS, MAX_POS = 0, 4095
+
+# --- 스마트 그리퍼 설정 ---
+GRIPPER_OPEN   = 1024   
+GRIPPER_CLOSED = 3500   
+
+# ==========================================
+# 2. 기구학 (Kinematics) 엔진
+# ==========================================
+def forward_kinematics(p11, p12, p13, p14):
+    t1 = (p11 - 2048) / 4096.0 * 2 * math.pi
+    t2 = -(p12 - 2048) / 4096.0 * 2 * math.pi
+    t3 = -(p13 - 2048) / 4096.0 * 2 * math.pi
+    t4 = -(p14 - 2048) / 4096.0 * 2 * math.pi
+
+    rw = L1 * math.cos(t2) + L2 * math.cos(t2 + t3)
+    zw = L1 * math.sin(t2) + L2 * math.sin(t2 + t3)
+
+    pitch = t2 + t3 + t4
+    r = rw + L3 * math.cos(pitch)
+    z = zw + L3 * math.sin(pitch)
+
+    x = r * math.cos(t1)
+    y = r * math.sin(t1)
+    
+    return x, y, z, pitch
+
+def inverse_kinematics(x, y, z, pitch):
+    t1 = math.atan2(y, x)
+    r = math.sqrt(x**2 + y**2)
+
+    rw = r - L3 * math.cos(pitch)
+    zw = z - L3 * math.sin(pitch)
+
+    D2 = rw**2 + zw**2
+    if D2 > (L1 + L2)**2: return None
+
+    cos_t3 = (D2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_t3 = max(-1.0, min(1.0, cos_t3))
+    t3 = -math.acos(cos_t3)
+
+    alpha = math.atan2(zw, rw)
+    beta = math.atan2(L2 * math.sin(abs(t3)), L1 + L2 * math.cos(t3))
+    t2 = alpha + beta
+
+    t4 = pitch - t2 - t3
+
+    return {
+        11: int(t1 * 4096 / (2*math.pi)) + 2048,
+        12: int(-t2 * 4096 / (2*math.pi)) + 2048,
+        13: int(-t3 * 4096 / (2*math.pi)) + 2048,
+        14: int(-t4 * 4096 / (2*math.pi)) + 2048
+    }
+
+# ==========================================
+# 3. 통신 및 스마트 초기화 설정
+# ==========================================
+portHandler = PortHandler(DEVICENAME)
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_GOAL_POSITION, LEN_GOAL_POSITION)
+
+if portHandler.openPort() and portHandler.setBaudRate(BAUDRATE):
+    print("[시스템] 통신 포트 연결 성공!")
+else: quit()
+
+# --- 1~4축 로봇 팔 초기화 (PID 게인 적용) ---
+for dxl_id in [11, 12, 13, 14]:
+    # 토크가 꺼진 상태에서 PID 게인을 안전하게 먼저 설정합니다.
+    packetHandler.write2ByteTxRx(portHandler, dxl_id, ADDR_POSITION_P_GAIN, POSITION_P_GAIN)
+    packetHandler.write2ByteTxRx(portHandler, dxl_id, ADDR_POSITION_I_GAIN, POSITION_I_GAIN)
+    packetHandler.write2ByteTxRx(portHandler, dxl_id, ADDR_POSITION_D_GAIN, POSITION_D_GAIN)
+    
+    packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_PROFILE_ACCELERATION, PROFILE_ACCELERATION_VALUE)
+    packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY_VALUE)
+    packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+
+# --- 5축 집게(15번) 스마트 그리퍼 세팅 ---
+packetHandler.write1ByteTxRx(portHandler, 15, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)      
+packetHandler.write1ByteTxRx(portHandler, 15, ADDR_OPERATING_MODE, 5)                  
+packetHandler.write1ByteTxRx(portHandler, 15, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)       
+packetHandler.write2ByteTxRx(portHandler, 15, ADDR_GOAL_CURRENT, GRAB_FORCE)           
+packetHandler.write4ByteTxRx(portHandler, 15, ADDR_PROFILE_ACCELERATION, GRIPPER_ACCELERATION_VALUE)
+packetHandler.write4ByteTxRx(portHandler, 15, ADDR_PROFILE_VELOCITY, GRIPPER_VELOCITY_VALUE)
+
+def add_sync_write_param(motor_id, target_pos):
+    target_pos = max(MIN_POS, min(MAX_POS, target_pos))
+    param_goal_position = [
+        DXL_LOBYTE(DXL_LOWORD(target_pos)), DXL_HIBYTE(DXL_LOWORD(target_pos)),
+        DXL_LOBYTE(DXL_HIWORD(target_pos)), DXL_HIBYTE(DXL_HIWORD(target_pos))
+    ]
+    groupSyncWrite.addParam(motor_id, param_goal_position)
+
+print("\n[시스템] 초기 자세로 순차 이동합니다...")
+for dxl_id in DXL_ID_LIST:
+    add_sync_write_param(dxl_id, INITIAL_POSITIONS[dxl_id])
+    groupSyncWrite.txPacket()
+    groupSyncWrite.clearParam()
+    time.sleep(1.0)
+
+# ==========================================
+# 4. 메인 제어 루프
+# ==========================================
+# 기본 모드를 XYZ 공간 제어로 시작하도록 설정
+control_mode = "XYZ"
+space_pressed_last = False
+c_pressed_last = False
+gripper_is_closed = False
+
+# 초기 좌표 설정
+target_x, target_y, target_z, target_pitch = forward_kinematics(
+    current_goals[11], current_goals[12], current_goals[13], current_goals[14]
+)
+
+print("\n================== 🎯 정밀 PID 공간 제어 모드 ==================")
+print(" [Spacebar] 모드 전환 (XYZ 공간 제어 <-> 관절 제어)")
+print("\n [XYZ 공간 제어 (신규 매핑)]")
+print("  X축 (+ / -) : D / A")
+print("  Y축 (+ / -) : W / S")
+print("  Z축 (+ / -) : E / Q")
+print("\n [스마트 그리퍼 제어]")
+print("  [ C ] 키 : 집게 열기 / 닫기 (토글)")
+print("\n  [ ESC ] 키 : 안전 복귀 및 프로그램 종료")
+print("===============================================================\n")
+
+try:
+    while True:
+        if keyboard.is_pressed('esc'):
+            print("\n[시스템] 마지막 자세로 복귀합니다...")
+            for dxl_id in [15, 14, 13, 12, 11]:
+                add_sync_write_param(dxl_id, FINAL_POSITIONS[dxl_id])
+                groupSyncWrite.txPacket()
+                groupSyncWrite.clearParam()
+                
+                if dxl_id == 11:
+                    stuck_count, last_position = 0, -1
+                    for _ in range(4):
+                        time.sleep(0.5)
+                        pos, _, _ = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRESENT_POSITION)
+                        if abs(pos - FINAL_POSITIONS[dxl_id]) < 20: break
+                        if last_position != -1 and abs(pos - last_position) <= 5:
+                            stuck_count += 1
+                            if stuck_count >= 2: break
+                        else: stuck_count = 0 
+                        last_position = pos
+                else:
+                    time.sleep(1.0) 
+            break  
+            
+        is_space_pressed = keyboard.is_pressed('space')
+        if is_space_pressed and not space_pressed_last:
+            if control_mode == "JOINT":
+                control_mode = "XYZ"
+                target_x, target_y, target_z, target_pitch = forward_kinematics(
+                    current_goals[11], current_goals[12], current_goals[13], current_goals[14]
+                )
+                print(f"\n🔄 [XYZ 모드 ON] 현재 위치: X={target_x:.1f}, Y={target_y:.1f}, Z={target_z:.1f}")
+            else:
+                control_mode = "JOINT"
+                print("\n🔄 [관절 모드 ON] 개별 모터 제어 활성화")
+        space_pressed_last = is_space_pressed
+
+        c_pressed = keyboard.is_pressed('c')
+        if c_pressed and not c_pressed_last:
+            if not gripper_is_closed:
+                packetHandler.write4ByteTxRx(portHandler, 15, ADDR_GOAL_POSITION, GRIPPER_CLOSED)
+                gripper_is_closed = True
+                print(">> ✊ [그리퍼] 물체를 부드럽게 잡습니다.")
+            else:
+                packetHandler.write4ByteTxRx(portHandler, 15, ADDR_GOAL_POSITION, GRIPPER_OPEN)
+                gripper_is_closed = False
+                print(">> 🖐️ [그리퍼] 물체를 놓습니다.")
+        c_pressed_last = c_pressed
+
+        updated_motors = []
+        
+        # --- 1. 신규 매핑이 적용된 XYZ 공간 제어 연산 ---
+        if control_mode == "XYZ":
+            xyz_updated = False
+            prev_x, prev_y, prev_z = target_x, target_y, target_z
+            
+            # X축 매핑: D(+), A(-)
+            if keyboard.is_pressed('d'): target_x += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('a'): target_x -= XYZ_STEP; xyz_updated = True
+            
+            # Y축 매핑: W(+), S(-)
+            if keyboard.is_pressed('w'): target_y += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('s'): target_y -= XYZ_STEP; xyz_updated = True
+            
+            # Z축 매핑: E(+), Q(-)
+            if keyboard.is_pressed('e'): target_z += XYZ_STEP; xyz_updated = True
+            elif keyboard.is_pressed('q'): target_z -= XYZ_STEP; xyz_updated = True
+            
+            if xyz_updated:
+                ik_result = inverse_kinematics(target_x, target_y, target_z, target_pitch)
+                if ik_result:
+                    for dxl_id in [11, 12, 13, 14]:
+                        current_goals[dxl_id] = ik_result[dxl_id]
+                        updated_motors.append(dxl_id)
+                else:
+                    target_x, target_y, target_z = prev_x, prev_y, prev_z
+        
+        # --- 2. 관절 제어 (조작 키가 중복되므로 XYZ 모드를 메인으로 사용 권장) ---
+        elif control_mode == "JOINT":
+            # Joint 모드 단축키는 XYZ 단축키와 중복되므로, 
+            # 필요 시 공간 제어(XYZ)를 메인으로 사용하시는 것이 좋습니다.
+            if keyboard.is_pressed('q'): current_goals[11] += JOINT_STEP; updated_motors.append(11)
+            elif keyboard.is_pressed('a'): current_goals[11] -= JOINT_STEP; updated_motors.append(11)
+            
+            if keyboard.is_pressed('w'): current_goals[12] += JOINT_STEP; updated_motors.append(12)
+            elif keyboard.is_pressed('s'): current_goals[12] -= JOINT_STEP; updated_motors.append(12)
+            
+            if keyboard.is_pressed('e'): current_goals[13] += JOINT_STEP; updated_motors.append(13)
+            elif keyboard.is_pressed('d'): current_goals[13] -= JOINT_STEP; updated_motors.append(13)
+            
+            if keyboard.is_pressed('r'): current_goals[14] += JOINT_STEP; updated_motors.append(14)
+            elif keyboard.is_pressed('f'): current_goals[14] -= JOINT_STEP; updated_motors.append(14)
+
+        if updated_motors:
+            updated_motors = list(set(updated_motors))
+            for dxl_id in updated_motors:
+                add_sync_write_param(dxl_id, current_goals[dxl_id])
+            groupSyncWrite.txPacket()
+            groupSyncWrite.clearParam()
+
+        time.sleep(0.03)
+
+finally:
+    for dxl_id in DXL_ID_LIST:
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+    portHandler.closePort()
+    print("\n시스템이 안전하게 종료되었습니다.")
