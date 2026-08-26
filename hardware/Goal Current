@@ -20,8 +20,8 @@ ADDR_PRESENT_POSITION       = 132   # 현재 위치 (4 Byte)
 LEN_GOAL_POSITION           = 4     # 목표 위치 데이터 길이 (4 Byte)
 
 # --- 제어 튜닝 파라미터 ---
-PROFILE_VELOCITY_VALUE      = 80   # 최고 이동 속도 (부드러운 제어를 위해 상향)
-PROFILE_ACCELERATION_VALUE  = 0    # 가속도 (작을수록 스무스하게 출발/정지)
+PROFILE_VELOCITY_VALUE      = 100   # 최고 이동 속도 (부드러운 제어를 위해 상향)
+PROFILE_ACCELERATION_VALUE  = 20    # 가속도 (작을수록 스무스하게 출발/정지)
 GRIPPER_VELOCITY_VALUE      = 30    # 집게 전용 속도 (아주 천천히 스르륵)
 GRIPPER_ACCELERATION_VALUE  = 10    # 집게 전용 가속도 (더욱 부드럽게 출발)
 GRAB_FORCE                  = 100   # 집게 파지력 (0~1193, 150은 연약한 물체용)
