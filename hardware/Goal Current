@@ -49,6 +49,14 @@ FINAL_POSITIONS   = {11: 0, 12: 720, 13: 3030, 14: 840, 15: 512}
 current_goals = INITIAL_POSITIONS.copy()
 MIN_POS, MAX_POS = 0, 4095
 
+SAFE_RANGES = {
+    11: (0, 4096),
+    12: (720, 2500),
+    13: (660, 3049),
+    14: (1411, 3470),
+    15: (1024, 2600)
+}
+
 # --- 스마트 그리퍼 설정 ---
 GRIPPER_OPEN   = 1024   # 집게 열림 위치
 GRIPPER_CLOSED = 3500   # 집게 닫힘 목표 위치 (닿으면 멈춤)
@@ -74,6 +82,10 @@ def forward_kinematics(p11, p12, p13, p14):
     y = r * math.sin(t1)
     
     return x, y, z, pitch
+
+def is_within_safe_range(motor_id, value):
+    min_val, max_val = SAFE_RANGES[motor_id]
+    return min_val <= value <= max_val
 
 def inverse_kinematics(x, y, z, pitch):
     """목표 X, Y, Z와 자세(Pitch)를 모터 펄스로 역산"""
@@ -102,6 +114,13 @@ def inverse_kinematics(x, y, z, pitch):
         13: int(-t3 * 4096 / (2*math.pi)) + 2048,
         14: int(-t4 * 4096 / (2*math.pi)) + 2048
     }
+
+    for motor_id, pos_value in result.items():
+        if not is_within_safe_range(motor_id, pos_value):
+            print(f"⚠️ [안전 정지] {motor_id}번 모터가 안전 범위를 벗어남 (계산값: {pos_value}, 허용범위: {SAFE_RANGES[motor_id]})")
+            return None  
+
+    return result
 
 # ==========================================
 # 3. 통신 및 스마트 초기화 설정
@@ -253,6 +272,10 @@ try:
             
             if keyboard.is_pressed('r'): current_goals[14] += JOINT_STEP; updated_motors.append(14)
             elif keyboard.is_pressed('f'): current_goals[14] -= JOINT_STEP; updated_motors.append(14)
+
+            for dxl_id in updated_motors:
+                min_val, max_val = SAFE_RANGES[dxl_id]
+                current_goals[dxl_id] = max(min_val, min(max_val, current_goals[dxl_id]))
 
         # --- 4. 데이터 동기화 전송 (11~14번 모터만) ---
         if updated_motors:
